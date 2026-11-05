@@ -1,0 +1,3 @@
+Model,Train_Accuracy,Test_Accuracy
+Logistic Regression,0.7725,0.772
+Random Forest,0.8476,0.796
