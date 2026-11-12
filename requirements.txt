@@ -1,9 +1,5 @@
 pandas
 numpy
-scikit-learn
-matplotlib
-seaborn
+scikit-learn==1.9.1
 streamlit
 joblib
-fastapi
-uvicorn
