@@ -1,4 +1,3 @@
-# test.py : loads the saved model and checks it on data it has never seen.
 
 from pathlib import Path
 import joblib
@@ -13,18 +12,17 @@ BASE = Path(__file__).parent
 OUT = BASE / "outputs"
 OUT.mkdir(exist_ok=True)
 
-# Check that train.py was run first
+
 if not (BASE / "model.pkl").exists() or not (BASE / "data" / "test_data.joblib").exists():
     raise SystemExit("Please run train.py first.")
 
-# Load the saved model and the 20% test data
 saved = joblib.load(BASE / "model.pkl")
 test = joblib.load(BASE / "data" / "test_data.joblib")
 model = saved["model"]
 X_test = test["X_test"].reindex(columns=saved["columns"])
 y_test = test["y_test"]
 
-# Predict: probability first, then cut at the threshold
+
 prob = model.predict_proba(X_test)[:, 1]
 pred = (prob >= saved["threshold"]).astype(int)
 
@@ -41,7 +39,7 @@ print("ROC-AUC          :", round(roc_auc_score(y_test, prob), 4))
 print("=" * 50)
 print(classification_report(y_test, pred, target_names=["Low (1-2)", "High (3-4)"]))
 
-# Confusion matrix picture
+# Confusion matrix 
 sns.heatmap(confusion_matrix(y_test, pred), annot=True, fmt="d", cmap="Blues",
             xticklabels=["Low", "High"], yticklabels=["Low", "High"])
 plt.xlabel("Predicted")
