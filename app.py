@@ -4,22 +4,25 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-import streamlit as st 
+import streamlit as st
 
 BASE = Path(__file__).parent
 OUT = BASE / "outputs"
 
-st.set_page_config(page_title="Accident Severity Predictor", page_icon="🚦", layout="wide")
+st.set_page_config(page_title="Accident Severity Predictor", layout="wide")
 
-# ------------------------------------------------------------ simple styling
+# ------------------------------------------------------------------ styling
 st.markdown("""
 <style>
 #MainMenu, footer, .stDeployButton {visibility: hidden;}
-.banner {padding: 22px 28px; border-radius: 14px; margin-bottom: 18px;
+.banner {padding: 26px 30px; border-radius: 16px; margin-bottom: 18px;
          background: linear-gradient(90deg, #1f3c88, #3b82f6); color: white;}
-.banner h1 {margin: 0; font-size: 32px; color: white;}
-.banner p {margin: 6px 0 0 0; font-size: 16px; opacity: 0.9;}
-.result {padding: 18px 20px; border-radius: 12px; background: rgba(128,128,128,0.12);}
+.banner h1 {margin: 0; font-size: 34px; color: white;}
+.banner p {margin: 8px 0 0 0; font-size: 17px; opacity: 0.92;}
+.step {font-weight: 700; font-size: 18px; margin-bottom: 2px;}
+.hint {opacity: 0.7; font-size: 14px; margin-bottom: 10px;}
+.result {padding: 20px 22px; border-radius: 14px; background: rgba(128,128,128,0.12);}
+.big {font-size: 40px; font-weight: 800; line-height: 1.1;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -36,7 +39,8 @@ def load_bundle():
 b = load_bundle()
 model, feature_cols, THR = b["model"], b["columns"], b["threshold"]
 freq_maps, locs, defaults = b["freq_maps"], b["locations"], b["defaults"]
-BASELINE = b["baseline"]
+BASELINE = b["baseline"]                    # share of LOW-impact accidents in the test data
+AVG_HIGH = 1 - BASELINE                     # share of HIGH-impact accidents (the "average" chance)
 
 POI = {"Junction": "Junction", "Traffic_Signal": "Traffic signal", "Crossing": "Crossing",
        "Stop": "Stop sign", "Station": "Station", "Amenity": "Amenity", "Railway": "Railway",
@@ -60,6 +64,7 @@ STATE_NAMES = {
 }
 
 
+# ------------------------------------------------------------------ helpers
 def clip(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -90,75 +95,140 @@ def predict_many(inputs):
 
 
 def risk_level(prob):
-    """HIGH if probability >= threshold, MODERATE if it is close, otherwise LOW."""
+    """Returns level, color, headline and a short plain-language note."""
     if prob >= THR:
-        return "HIGH", "#e74c3c", "Long traffic delay expected (severity 3-4)"
+        return ("HIGH", "#e74c3c", "This looks like a high-impact accident.",
+                "The model expects a long traffic delay in these conditions.")
     if prob >= THR * 0.7:
-        return "MODERATE", "#f39c12", "Close to the high-impact threshold"
-    return "LOW", "#2ecc71", "Short traffic delay expected (severity 1-2)"
+        return ("MODERATE", "#f39c12", "Not high, but close to the line.",
+                "The delay could go either way, so conditions like these deserve some caution.")
+    return ("LOW", "#2ecc71", "This looks like a low-impact accident.",
+            "The model expects traffic to recover fairly quickly.")
+
+
+def gauge(prob, thr, color):
+    """A simple risk bar with the cut-off marked."""
+    return f"""
+<div style="position:relative; height:18px; border-radius:9px; background:rgba(128,128,128,0.25);
+            margin:14px 0 34px 0;">
+  <div style="width:{min(prob, 1) * 100:.1f}%; height:100%; border-radius:9px; background:{color};"></div>
+  <div style="position:absolute; left:{thr * 100:.1f}%; top:-5px; height:28px; border-left:3px solid #7f8c8d;"></div>
+  <div style="position:absolute; left:{thr * 100:.1f}%; top:26px; font-size:12px; opacity:0.8;
+              transform:translateX(-50%);">cut-off {thr * 100:.0f}%</div>
+</div>"""
+
+
+def compare_line(label, other, prob):
+    diff = (prob - other) * 100
+    if abs(diff) < 0.5:
+        return f"{label}: about the same ({other * 100:.1f}%)."
+    word = "higher" if diff > 0 else "lower"
+    return f"{label}: {other * 100:.1f}%, so yours is {abs(diff):.1f} points {word}."
+
+
+# ---------------------------------------- form defaults and quick examples
+DEFAULTS = {
+    "day": date(2022, 6, 15), "tm": time(17, 30), "light": "Day", "roads": [], "weather": "Clear",
+    "temp": int(clip(defaults["Temperature(F)"], -20, 115)),
+    "hum": int(clip(defaults["Humidity(%)"], 0, 100)),
+    "vis": float(round(clip(defaults["Visibility(mi)"], 0, 10) * 2) / 2),
+    "wind": int(clip(defaults["Wind_Speed(mph)"], 0, 60)),
+    "pres": float(round(clip(defaults["Pressure(in)"], 25, 32), 1)),
+    "precip": 0.0,
+}
+for k, v in DEFAULTS.items():
+    st.session_state.setdefault(k, v)
+st.session_state.setdefault("history", [])
+
+PRESETS = {
+    "Rainy rush hour": {"tm": time(17, 30), "light": "Day", "weather": "Rain", "hum": 90,
+                        "vis": 4.0, "precip": 0.2,
+                        "roads": ["Junction", "Traffic signal", "Crossing"]},
+    "Snowy morning": {"tm": time(8, 0), "light": "Day", "weather": "Snow/Ice", "temp": 25,
+                      "hum": 85, "vis": 2.0, "precip": 0.1, "roads": ["Junction"]},
+    "Quiet clear night": {"tm": time(2, 0), "light": "Night", "weather": "Clear", "roads": []},
+    "Sunny afternoon": {"tm": time(14, 0), "light": "Day", "weather": "Clear",
+                        "roads": ["Traffic signal"]},
+}
+
+
+def apply_preset(name):
+    st.session_state.update({**DEFAULTS, **PRESETS[name]})
 
 
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
-    st.title("🚦 Accident Severity")
-    st.caption("Predicts whether an accident will cause a HIGH or LOW traffic impact.")
-    st.markdown("**How to use**")
-    st.markdown("1. Choose the location\n2. Set the time and weather\n"
-                "3. Pick nearby road features\n4. Click **Predict severity**")
+    st.title("Accident Severity")
+    st.caption("A machine learning demo that estimates how badly an accident will disrupt traffic.")
+    st.markdown("**How to use it**")
+    st.markdown("1. Pick an example or fill in the 4 steps\n"
+                "2. Click **Predict**\n"
+                "3. Read the result and the 'why' section")
     st.divider()
     st.markdown(f"**Model:** {b['model_name']}")
-    st.markdown(f"**Threshold:** {THR:.2f}")
-    st.markdown(f"**Baseline accuracy:** {BASELINE * 100:.1f}%")
+    st.markdown(f"**Cut-off for HIGH:** {THR * 100:.0f}% chance")
     st.divider()
-    st.caption("Mini project · US Accidents dataset (2016-2023)")
+    st.caption("Mini project | US Accidents dataset (2016-2023)")
 
 st.markdown("""
 <div class="banner">
-  <h1>🚦 Traffic Accident Severity Predictor</h1>
-  <p>Enter the conditions of an accident and the model predicts its traffic impact.</p>
+  <h1>Traffic Accident Severity Predictor</h1>
+  <p>Tell us where, when and in what conditions an accident happens, and we'll estimate
+     how long it is likely to disrupt traffic.</p>
 </div>
 """, unsafe_allow_html=True)
 
-tab_pred, tab_ins, tab_about = st.tabs(["🔮 Predict", "📊 Model Insights", "ℹ️ About"])
+tab_pred, tab_ins, tab_about = st.tabs(["Predict", "How good is the model?", "About"])
 
 # ------------------------------------------------------------- predict tab
 with tab_pred:
+    st.markdown("#### In a hurry? Try a quick example")
+    p_cols = st.columns(len(PRESETS))
+    for col, name in zip(p_cols, PRESETS):
+        col.button(name, on_click=apply_preset, args=(name,), use_container_width=True)
+    st.write("")
+
     c1, c2, c3 = st.columns(3)
 
     with c1:
         with box():
-            st.subheader("📍 Location")
+            st.markdown('<div class="step">Step 1: Where?</div>'
+                        '<div class="hint">Choose the state and city.</div>', unsafe_allow_html=True)
             state = st.selectbox("State",
                                  sorted(locs["State"].unique(), key=lambda s: STATE_NAMES.get(s, s)),
                                  format_func=lambda s: STATE_NAMES.get(s, s))
             s_locs = locs[locs["State"] == state]
             city = st.selectbox("City", sorted(s_locs["City"].unique()))
             loc = s_locs[s_locs["City"] == city].iloc[0]
-            st.map(pd.DataFrame({"lat": [loc["Start_Lat"]], "lon": [loc["Start_Lng"]]}), height=220)
+            st.map(pd.DataFrame({"lat": [loc["Start_Lat"]], "lon": [loc["Start_Lng"]]}), height=200)
 
     with c2:
         with box():
-            st.subheader("🕒 Time")
-            d = st.date_input("Date", date(2022, 6, 15))
-            t = st.time_input("Time", time(17, 30))
-            light = st.radio("Light condition", ["Day", "Night"], horizontal=True)
+            st.markdown('<div class="step">Step 2: When?</div>'
+                        '<div class="hint">Rush hours and darkness change traffic a lot.</div>',
+                        unsafe_allow_html=True)
+            d = st.date_input("Date", key="day")
+            t = st.time_input("Time", key="tm")
+            light = st.radio("Light condition", ["Day", "Night"], horizontal=True, key="light")
         with box():
-            st.subheader("🛣️ Road features nearby")
-            chosen = st.multiselect("Select all that apply", list(POI.values()))
+            st.markdown('<div class="step">Step 3: What is nearby?</div>'
+                        '<div class="hint">Pick everything close to the accident spot.</div>',
+                        unsafe_allow_html=True)
+            chosen = st.multiselect("Road features", list(POI.values()), key="roads")
 
     with c3:
         with box():
-            st.subheader("🌦️ Weather")
-            weather = st.selectbox("Weather", WEATHER)
-            temp = st.slider("Temperature (°F)", -20, 115, int(clip(defaults["Temperature(F)"], -20, 115)))
-            hum = st.slider("Humidity (%)", 0, 100, int(clip(defaults["Humidity(%)"], 0, 100)))
-            vis = st.slider("Visibility (miles)", 0.0, 10.0,
-                            float(clip(defaults["Visibility(mi)"], 0, 10)), 0.5)
-            wind = st.slider("Wind speed (mph)", 0, 60, int(clip(defaults["Wind_Speed(mph)"], 0, 60)))
-            p1, p2 = st.columns(2)
-            pres = p1.number_input("Pressure (in)", 25.0, 32.0,
-                                   float(clip(defaults["Pressure(in)"], 25, 32)), 0.1)
-            precip = p2.number_input("Rain (in)", 0.0, 3.0, 0.0, 0.01)
+            st.markdown('<div class="step">Step 4: What is the weather like?</div>'
+                        '<div class="hint">Leave the sliders alone if you are not sure.</div>',
+                        unsafe_allow_html=True)
+            weather = st.selectbox("Weather", WEATHER, key="weather")
+            temp = st.slider("Temperature (F)", -20, 115, key="temp")
+            hum = st.slider("Humidity (%)", 0, 100, key="hum")
+            vis = st.slider("Visibility (miles)", 0.0, 10.0, step=0.5, key="vis")
+            wind = st.slider("Wind speed (mph)", 0, 60, key="wind")
+            q1, q2 = st.columns(2)
+            pres = q1.number_input("Pressure (in)", 25.0, 32.0, step=0.1, key="pres")
+            precip = q2.number_input("Rain (in)", 0.0, 3.0, step=0.01, key="precip")
 
     inp = {"Start_Lat": float(loc["Start_Lat"]), "Start_Lng": float(loc["Start_Lng"]),
            "City": loc["City"], "County": loc["County"], "State": loc["State"],
@@ -170,46 +240,91 @@ with tab_pred:
         inp[key] = int(label in chosen)
 
     st.write("")
-    go = st.button("🔍 Predict severity", type="primary", use_container_width=True)
+    go = st.button("Predict what will happen", type="primary", use_container_width=True)
 
     if go:
-        prob = float(predict_many([inp])[0])
-        level, color, message = risk_level(prob)
+        # one batch call: your input + three "what if" cases + 24 hours + 6 weather types
+        batch = [inp,
+                 dict(inp, Weather_Group="Clear"),
+                 dict(inp, **{k: 0 for k in POI}),
+                 dict(inp, Hour=3)]
+        batch += [dict(inp, Hour=h) for h in range(24)]
+        batch += [dict(inp, Weather_Group=w) for w in WEATHER]
+        p = predict_many(batch)
 
-        st.markdown("### Result")
-        r1, r2 = st.columns([1, 2])
+        place = f"{city}, {STATE_NAMES.get(state, state)}"
+        when = f"{d.strftime('%A, %d %B %Y')} at {t.strftime('%I:%M %p')}"
+        roads_txt = ", ".join(chosen) if chosen else "none selected"
+        st.session_state["last"] = {
+            "prob": float(p[0]), "p_clear": float(p[1]), "p_noroad": float(p[2]),
+            "p_3am": float(p[3]), "hours": p[4:28], "wx": p[28:],
+            "place": place, "when": when, "weather": weather, "roads": chosen,
+            "roads_txt": roads_txt, "hour": t.hour}
+        st.session_state["history"].append(
+            {"Place": place, "Time": t.strftime("%I:%M %p"), "Weather": weather,
+             "Road features": roads_txt, "Chance of high impact": f"{p[0] * 100:.1f}%",
+             "Result": risk_level(float(p[0]))[0]})
+
+    last = st.session_state.get("last")
+    if last:
+        prob = last["prob"]
+        level, color, headline, note = risk_level(prob)
+
+        st.divider()
+        st.markdown(f"### Result for {last['place']}")
+        st.caption(f"{last['when']} | {last['weather']} weather | road features: {last['roads_txt']}")
+
+        r1, r2 = st.columns(2)
         with r1:
             st.markdown(f"""
 <div class="result" style="border-left: 8px solid {color};">
   <div style="font-size:14px; opacity:0.7;">Predicted traffic impact</div>
-  <div style="font-size:36px; font-weight:700; color:{color};">{level}</div>
-  <div style="font-size:15px;">{message}</div>
+  <div class="big" style="color:{color};">{level}</div>
+  <div style="font-size:17px; margin-top:6px;"><b>{headline}</b></div>
+  <div style="font-size:15px; opacity:0.85; margin-top:4px;">{note}</div>
 </div>
 """, unsafe_allow_html=True)
-            st.write("")
-            st.metric("Probability of high impact", f"{prob * 100:.1f}%")
-            st.progress(min(prob, 1.0))
-            st.caption(f"Marked HIGH when the probability is at least {THR * 100:.0f}%.")
-            st.caption(f"{STATE_NAMES.get(state, state)}, {city} · {t.strftime('%H:%M')} · "
-                       f"{weather} · {len(chosen)} road feature(s)")
+            st.markdown(gauge(prob, THR, color), unsafe_allow_html=True)
+            st.markdown(f"**{prob * 100:.1f}%** chance of a high-impact accident. "
+                        f"An average accident in the data has about **{AVG_HIGH * 100:.1f}%**.")
 
         with r2:
-            st.markdown("**What-if: risk at each hour of the day** (other inputs unchanged)")
-            hr = pd.DataFrame({"Risk": predict_many([dict(inp, Hour=h) for h in range(24)]),
-                               "Threshold": THR},
-                              index=pd.Index(range(24), name="Hour"))
-            st.line_chart(hr)
+            st.markdown("#### Why? What if things were different")
+            if last["weather"] != "Clear":
+                st.markdown("- " + compare_line("If the weather were Clear", last["p_clear"], prob))
+            if last["roads"]:
+                st.markdown("- " + compare_line("If there were no road features nearby",
+                                                last["p_noroad"], prob))
+            if last["hour"] != 3:
+                st.markdown("- " + compare_line("If it happened at 3 AM", last["p_3am"], prob))
+            st.caption("These are the model's estimates. They show patterns in past data, "
+                       "not proven causes.")
 
-        st.markdown("**What-if: risk under each weather condition**")
-        wx = pd.DataFrame({"Risk": predict_many([dict(inp, Weather_Group=w) for w in WEATHER])},
-                          index=WEATHER)
-        st.bar_chart(wx)
-    else:
-        st.info("Choose the conditions above and click **Predict severity**.")
+        g1, g2 = st.columns(2)
+        with g1:
+            st.markdown("**How the chance changes through the day**")
+            st.line_chart(pd.DataFrame({"Chance of high impact": last["hours"], "Cut-off": THR},
+                                       index=pd.Index(range(24), name="Hour of day")))
+        with g2:
+            st.markdown("**How the chance changes with the weather**")
+            st.bar_chart(pd.DataFrame({"Chance of high impact": last["wx"]}, index=WEATHER))
+
+        summary = (f"Traffic accident severity prediction\n"
+                   f"Place: {last['place']}\nWhen: {last['when']}\nWeather: {last['weather']}\n"
+                   f"Road features: {last['roads_txt']}\n"
+                   f"Result: {level} ({prob * 100:.1f}% chance of high impact, "
+                   f"cut-off {THR * 100:.0f}%)\n")
+        st.download_button("Download this result", summary, file_name="prediction.txt")
+
+    if st.session_state["history"]:
+        with st.expander(f"Your recent predictions ({len(st.session_state['history'])})"):
+            st.dataframe(pd.DataFrame(st.session_state["history"][-10:][::-1]),
+                         hide_index=True, use_container_width=True)
 
 # ------------------------------------------------------------ insights tab
 with tab_ins:
-    st.header("Model performance")
+    st.header("How good is the model?")
+    st.caption("All scores below come from accidents the model never saw during training.")
     csv = OUT / "model_comparison.csv"
     acc_csv = OUT / "train_test_accuracy.csv"
 
@@ -217,63 +332,75 @@ with tab_ins:
         res = pd.read_csv(csv)
         final = res[res["Model"] == "Random Forest"].iloc[0]
 
-        # --- train vs test accuracy
-        st.subheader("Train vs test accuracy (Random Forest)")
+        st.subheader("Scores for the final model (Random Forest)")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Accuracy", f"{final['Accuracy'] * 100:.1f}%")
+        m2.metric("Macro F1", f"{final['Macro_F1']:.3f}")
+        m3.metric("Recall (high)", f"{final['Recall']:.3f}")
+        m4.metric("ROC-AUC", f"{final['ROC_AUC']:.3f}")
+        st.caption(f"For comparison, always guessing 'low impact' would score "
+                   f"about {BASELINE * 100:.1f}% accuracy.")
+
+        with st.expander("What do these numbers mean?"):
+            st.markdown("""
+- **Accuracy:** out of 100 accidents, how many were predicted correctly.
+- **Recall (high):** out of all real high-impact accidents, how many the model found.
+- **Macro F1:** one balanced score that treats high and low impact accidents equally.
+- **ROC-AUC:** how well the model ranks risky accidents above safe ones (0.5 = guessing, 1.0 = perfect).
+
+About 8 in 10 accidents are low impact, so accuracy alone can look good even for a weak model.
+That is why recall, macro F1 and ROC-AUC are shown too.
+""")
+
+        st.subheader("Is the model overfitting?")
         if acc_csv.exists():
             acc = pd.read_csv(acc_csv)
             rf_acc = acc[acc["Model"] == "Random Forest"].iloc[0]
             gap = (rf_acc["Train_Accuracy"] - rf_acc["Test_Accuracy"]) * 100
-            a1, a2, a3, a4 = st.columns(4)
+            a1, a2, a3 = st.columns(3)
             a1.metric("Train accuracy", f"{rf_acc['Train_Accuracy'] * 100:.1f}%")
             a2.metric("Test accuracy", f"{rf_acc['Test_Accuracy'] * 100:.1f}%")
-            a3.metric("Gap (train - test)", f"{gap:.1f} pts")
-            a4.metric("Baseline accuracy", f"{BASELINE * 100:.1f}%")
-            st.dataframe(acc, hide_index=True, use_container_width=True)
+            a3.metric("Gap", f"{gap:.1f} pts")
             if gap > 10:
-                st.warning("Train accuracy is much higher than test accuracy: the model may be overfitting.")
+                st.warning("Train accuracy is much higher than test accuracy, "
+                           "so the model may be memorising the training data.")
             else:
-                st.caption("A small gap between train and test accuracy means the model is not overfitting badly.")
+                st.caption("A small gap means the model works about as well on new accidents "
+                           "as on the ones it learned from.")
         else:
             st.info("Run  python train.py  to create outputs/train_test_accuracy.csv")
 
-        # --- test metrics
-        st.subheader("Test set metrics")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Test accuracy", f"{final['Accuracy'] * 100:.1f}%")
-        m2.metric("Macro F1", f"{final['Macro_F1']:.3f}")
-        m3.metric("Recall (high)", f"{final['Recall']:.3f}")
-        m4.metric("ROC-AUC", f"{final['ROC_AUC']:.3f}")
+        st.subheader("Both models side by side")
         st.dataframe(res, hide_index=True, use_container_width=True)
-        st.caption("Accuracy alone is misleading on imbalanced data (about 80% of accidents "
-                   "are low impact), so macro F1, recall and ROC-AUC are shown too.")
     else:
         st.info("Run train.py to create outputs/model_comparison.csv")
 
-    for title, fname in [("Exploratory analysis", "eda.png"),
-                         ("Confusion matrix (from test.py)", "test_confusion_matrix.png"),
-                         ("Most important features", "feature_importance.png")]:
+    for title, fname in [("What the data looks like", "eda.png"),
+                         ("Where the model gets it right and wrong", "test_confusion_matrix.png"),
+                         ("What the model pays most attention to", "feature_importance.png")]:
         if (OUT / fname).exists():
             with box():
                 st.subheader(title)
                 st.image(str(OUT / fname))
 
-# about tab
+# ---------------------------------------------------------------- about tab
 with tab_about:
     st.header("About this project")
     st.markdown("""
-**Problem:** Predict whether a road accident will have a high traffic impact (severity 3-4)
-or a low impact (severity 1-2), using only information known when the accident happens.
+**The question:** when a road accident happens, will it cause a long traffic delay (high impact)
+or a short one (low impact)?
 
-**Dataset:** US Accidents (2016-2023) by Sobhan Moosavi (Kaggle). A random sample was used.
+**The data:** US Accidents (2016-2023) by Sobhan Moosavi (Kaggle). A random sample was used.
 
-**Method:** cleaning → time, weather and location features → Logistic Regression (baseline)
-and Random Forest (final model) → evaluation on a held-out test set.
+**How it works:** the data is cleaned, time, weather and location features are created, and two
+models are trained: Logistic Regression (a simple baseline) and Random Forest (the final model).
+They are tested on accidents they have never seen.
 
-**Limitations:**
-- Severity in this dataset measures traffic delay, not injuries.
+**Good to know**
+- "Severity" in this dataset means **traffic delay**, not how badly people were hurt.
 - Only reported accidents are included.
-- The model shows association, not causation.
-- A US-trained model may not transfer directly to Indian roads.
+- The model finds patterns, not causes.
+- It was trained on US data, so it may not fit Indian roads.
 
-**Future work:** Indian accident data, live weather, hotspot mapping and time-based forecasting.
+**Future work:** Indian accident data, live weather, hotspot maps and time-based forecasting.
 """)
